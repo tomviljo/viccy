@@ -14,6 +14,8 @@ import tiktoken
 
 load_dotenv()
 
+port = int(os.environ.get('PORT', '8000'))
+
 openai.api_key = os.environ['OPENAI_API_KEY']
 
 gpt_model = os.environ.get('GPT_MODEL', 'gpt-3.5-turbo-0301')
@@ -279,4 +281,4 @@ def handle_home_opened(client, event, logger):
         logger.error(f"Error publishing home tab: {e}")
 
 if __name__ == '__main__':
-    app.start(4000)
+    app.start(port)
