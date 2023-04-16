@@ -14,6 +14,7 @@ import tiktoken
 
 load_dotenv()
 
+bot_name = os.environ.get('BOT_NAME', 'viccy')
 port = int(os.environ.get('PORT', '8000'))
 
 openai.api_key = os.environ['OPENAI_API_KEY']
@@ -56,16 +57,43 @@ def truncate(text, length=50):
 def snippet(text):
     return truncate(normalize_whitespace(escape(sanitize(text))))
 
-def get_history(channel):
-    history = app.client.conversations_history(
-        channel = channel,
-        include_all_metadata = True,
-        limit = 200
-    )
-    messages = list(reversed(history.get('messages', [])))
+def is_bot_message(message):
+    # TODO: Check bot_id for authenticity
+    if 'metadata' not in message:
+        return False
+    if 'event_type' not in message['metadata']:
+        return False
+    return message['metadata']['event_type'].startswith('viccy_')
+
+def get_history(channel, thread_ts):
+    if thread_ts:
+        # Get unthreaded messages before thread parent, newest to oldest
+        history = app.client.conversations_history(
+            channel = channel,
+            latest = thread_ts,
+            include_all_metadata = True,
+            limit = 200
+        )
+        # Get threaded messages including the thread parent, oldest to newest
+        replies = app.client.conversations_replies(
+            channel = channel,
+            ts = thread_ts,
+            include_all_metadata = True,
+            limit = 200
+        )
+        messages = list(reversed(history['messages'])) + replies['messages']
+    else:
+        # Get unthreaded messages, newest to oldest
+        history = app.client.conversations_history(
+            channel = channel,
+            include_all_metadata = True,
+            limit = 200
+        )
+        messages = list(reversed(history['messages']))
+    # for m in messages:
+    #     print(f'--- history ts {m["ts"]} thread_ts {m.get("thread_ts")} text {snippet(m["text"])}')
     messages_by_ts = {m['ts']: m for m in messages}
-    bot_messages = [m for m in messages if m.get('metadata', {}).get('event_type', '').startswith('viccy_')]  # TODO: Check bot_id for authenticity
-    response_messages = [m for m in messages if m.get('metadata', {}).get('event_type') == 'viccy_response']  # TODO: Check bot_id for authenticity
+    bot_messages = [m for m in messages if is_bot_message(m)]
     # TODO: Optimize
     recording = True
     pairs = []
@@ -112,15 +140,6 @@ def completion_cost(result, model):
     return result.usage.total_tokens * 0.002 / 1000.0
 
 def handle_request(event, say):
-    is_im = event.get('channel_type') == 'im'
-    if 'thread_ts' in event:
-        sorry = 'Sorry' if is_im else f"Sorry <@{event['user']}>"
-        say(
-            text = f"{sorry}, I don't reply in threads because I need our chat history to be linear.",
-            thread_ts = event['thread_ts']
-        )
-        return
-
     system_message = {'role': 'system', 'content': gpt_system_message}
     prompt = sanitize(event['text'])
     prompt_message = {'role': 'user', 'content': prompt}
@@ -131,7 +150,7 @@ def handle_request(event, say):
     )
     max_prompt_tokens = gpt_max_tokens - gpt_reply_tokens
 
-    pairs, recording = get_history(event['channel'])
+    pairs, recording = get_history(event['channel'], event.get('thread_ts'))
     history_messages = []
     for pair in reversed(pairs):  # Start from the latest and work backward
         user_message = {'role': 'user', 'content': sanitize(pair[0]['text'])}
@@ -160,9 +179,11 @@ def handle_request(event, say):
     cost = completion_cost(result, gpt_model)
     print(f'Completion finished: {actual_prompt_tokens}/{prompt_tokens} prompt tokens, {completion_tokens} completion tokens, {total_tokens} total tokens, {cost} dollars')
 
+    is_im = event.get('channel_type') == 'im'
     prefix = '' if is_im else f"<@{event['user']}> "
     say(
         text = prefix + response,
+        thread_ts = event.get('thread_ts'),
         metadata = {
             'event_type': 'viccy_response',
             'event_payload': {
@@ -173,17 +194,16 @@ def handle_request(event, say):
 
 @app.event('app_mention')
 def handle_mention(event, say):
-    print('app_mention:', event)
+    print('app_mention event:', event)
     handle_request(event, say)
 
-@app.message()
+@app.event('message')
 def handle_message(event, say):
-    print('message:', event)
-    # print('message:', event['text'])
+    print('message event:', event)
     if event.get('channel_type') == 'im':
         handle_request(event, say)
 
-@app.command('/viccy')
+@app.command(f'/{bot_name}')
 def handle_command(ack, say, command):
     print('command:', command)
     # ack(response_type = 'in_channel')
@@ -198,11 +218,12 @@ def handle_command(ack, say, command):
     usage = \
         'I understand these commands:\n' \
         '```\n' \
-        '/viccy start   Start recording chat history\n' \
-        '/viccy stop    Stop recording chat history\n' \
-        '/viccy status  Check whether I am recording chat history\n' \
-        '/viccy reset   Clear all chat history\n' \
-        '/viccy list    Print the chat history\n' \
+        f'/{bot_name} start   Start recording chat history\n' \
+        f'/{bot_name} stop    Stop recording chat history\n' \
+        f'/{bot_name} status  Check whether I am recording chat history\n' \
+        f'/{bot_name} reset   Clear all chat history\n' \
+        f'/{bot_name} list    Print the chat history\n' \
+        f'/{bot_name} gpt     Print GPT parameters\n' \
         '```'
     by_request = '' if command['channel_id'].startswith('D') else f", by request from <@{command['user_id']}>"
 
@@ -238,12 +259,16 @@ def handle_command(ack, say, command):
             }
         )
     elif subcommand == 'list':
-        pairs, recording = get_history(command['channel_id'])
+        pairs, recording = get_history(command['channel_id'], command.get('thread_ts'))
         pairs_text = '\n'.join([f"> {snippet(p[0]['text'])}\n{snippet(p[1]['text'])}" for p in pairs])
         if pairs_text:
             ephemeral('This is the chat history:\n' + pairs_text)
         else:
             ephemeral('The chat history is empty.')
+    elif subcommand == 'gpt':
+        ephemeral(
+            f'I am based on the {gpt_model} model with temperature {gpt_temperature}, presence penalty {gpt_presence_penalty} and frequency penalty {gpt_frequency_penalty}.'
+        )
     elif subcommand in ['', 'help']:
         ephemeral(usage)
     else:
@@ -270,8 +295,18 @@ def handle_home_opened(client, event, logger):
                     {
                         "type": "section",
                         "text": {
-                          "type": "mrkdwn",
-                          "text": "There is not much to see here yet."
+                            "type": "mrkdwn",
+                            "text": (
+                                "I am an assistant based on ChatGPT, with the following added features:\n"
+                                "\n"
+                                "*Group chats*. Multiple users can participate in chatting with me, just ping me in a channel or group conversation.\n"
+                                "\n"
+                                "*Threaded conversations*. Reply to me in a thread to go off on a tangent.\n"
+                                "\n"
+                                f"*Freeze and unfreeze history*. Establish a context through dialogue and turn it into a template for answering questions. Type `/{bot_name}` to learn more.\n"
+                                "\n"
+                                "Please be patient with me, I am in an early stage of development."
+                            )
                         }
                     }
                 ]
