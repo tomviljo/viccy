@@ -96,6 +96,7 @@ def get_history(channel, thread_ts):
     bot_messages = [m for m in messages if is_bot_message(m)]
     # TODO: Optimize
     recording = True
+    system_message = None
     pairs = []
     for bot_message in bot_messages:
         event_type = bot_message['metadata']['event_type']
@@ -114,8 +115,18 @@ def get_history(channel, thread_ts):
         elif event_type == 'viccy_stop':
             recording = False
         elif event_type == 'viccy_reset':
+            system_message = None
             pairs = []
-    return pairs, recording
+        elif event_type == 'viccy_system':
+            content = bot_message.get('metadata', {}).get('event_payload', {}).get('content')
+            if not content:
+                continue
+            system_message = content
+    return {
+        'pairs': pairs, 
+        'system_message': system_message or gpt_system_message,
+        'recording': recording
+    }
 
 # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
 def count_message_tokens(message, model):
@@ -140,19 +151,20 @@ def completion_cost(result, model):
     return result.usage.total_tokens * 0.002 / 1000.0
 
 def handle_request(event, say):
-    system_message = {'role': 'system', 'content': gpt_system_message}
-    prompt = sanitize(event['text'])
-    prompt_message = {'role': 'user', 'content': prompt}
+    history = get_history(event['channel'], event.get('thread_ts'))
+
+    system_message = {'role': 'system', 'content': history['system_message']}
+    question = sanitize(event['text'])
+    question_message = {'role': 'user', 'content': question}
     prompt_tokens = (
         gpt_overhead_tokens + 
         count_message_tokens(system_message, gpt_model) + 
-        count_message_tokens(prompt_message, gpt_model)
+        count_message_tokens(question_message, gpt_model)
     )
     max_prompt_tokens = gpt_max_tokens - gpt_reply_tokens
 
-    pairs, recording = get_history(event['channel'], event.get('thread_ts'))
     history_messages = []
-    for pair in reversed(pairs):  # Start from the latest and work backward
+    for pair in reversed(history['pairs']):  # Start from the latest and work backward
         user_message = {'role': 'user', 'content': sanitize(pair[0]['text'])}
         assistant_message = {'role': 'assistant', 'content': sanitize(pair[1]['text'])}
         pair_tokens = count_message_tokens(user_message, gpt_model) + count_message_tokens(assistant_message, gpt_model)
@@ -161,7 +173,7 @@ def handle_request(event, say):
         prompt_tokens += pair_tokens
         history_messages.append(assistant_message)  # Put the reply first because we will reverse the list
         history_messages.append(user_message)
-    messages = [system_message] + list(reversed(history_messages)) + [prompt_message]
+    messages = [system_message] + list(reversed(history_messages)) + [question_message]
     # print(messages)
 
     result = openai.ChatCompletion.create(
@@ -218,17 +230,20 @@ def handle_command(ack, say, command):
     usage = \
         'I understand these commands:\n' \
         '```\n' \
-        f'/{bot_name} start   Start recording chat history\n' \
-        f'/{bot_name} stop    Stop recording chat history\n' \
-        f'/{bot_name} status  Check whether I am recording chat history\n' \
-        f'/{bot_name} reset   Clear all chat history\n' \
-        f'/{bot_name} list    Print the chat history\n' \
-        f'/{bot_name} gpt     Print GPT parameters\n' \
+        f'/{bot_name} start             Start recording chat history\n' \
+        f'/{bot_name} stop              Stop recording chat history\n' \
+        f'/{bot_name} status            Check whether I am recording chat history\n' \
+        f'/{bot_name} system            Print my current system message\n' \
+        f'/{bot_name} system [message]  Set my system message\n' \
+        f'/{bot_name} reset             Clear the chat history and system message\n' \
+        f'/{bot_name} list              Print the chat history\n' \
         '```'
     by_request = '' if command['channel_id'].startswith('D') else f", by request from <@{command['user_id']}>"
 
-    subcommand = command['text']
-    if subcommand == 'start':
+    cmd_and_arg = command['text'].split(maxsplit = 1)
+    cmd = cmd_and_arg[0].lower() if len(cmd_and_arg) else ''
+    arg = cmd_and_arg[1] if len(cmd_and_arg) == 2 else ''
+    if cmd == 'start' and not arg:
         say(
             text = f'Starting to record chat history{by_request}.',
             metadata = {
@@ -236,7 +251,7 @@ def handle_command(ack, say, command):
                 'event_payload': {}
             }
         )
-    elif subcommand == 'stop':
+    elif cmd == 'stop' and not arg:
         say(
             text = f'I am no longer recording chat history{by_request}.',
             metadata = {
@@ -244,13 +259,26 @@ def handle_command(ack, say, command):
                 'event_payload': {}
             }
         )
-    elif subcommand == 'status':
-        pairs, recording = get_history(command['channel_id'])
-        if recording:
+    elif cmd == 'status' and not arg:
+        history = get_history(command['channel_id'])
+        if history['recording']:
             ephemeral('Yes, I am recording chat history.')
         else:
             ephemeral('No, I am not recording chat history.')
-    elif subcommand == 'reset':
+    elif cmd == 'system' and not arg:
+        history = get_history(command['channel_id'], command.get('thread_ts'))
+        ephemeral(f"This is my current system message:\n>{history['system_message']}")
+    elif cmd == 'system' and arg:
+        say(
+            text = f'Updated my system message{by_request}:\n>{arg}',
+            metadata = {
+                'event_type': 'viccy_system',
+                'event_payload': {
+                    'content': arg
+                }
+            }
+        )
+    elif cmd == 'reset' and not arg:
         say(
             text = f'Cleared all chat history{by_request}.',
             metadata = {
@@ -258,21 +286,21 @@ def handle_command(ack, say, command):
                 'event_payload': {}
             }
         )
-    elif subcommand == 'list':
-        pairs, recording = get_history(command['channel_id'], command.get('thread_ts'))
-        pairs_text = '\n'.join([f"> {snippet(p[0]['text'])}\n{snippet(p[1]['text'])}" for p in pairs])
+    elif cmd == 'list' and not arg:
+        history = get_history(command['channel_id'], command.get('thread_ts'))
+        pairs_text = '\n'.join([f"> {snippet(p[0]['text'])}\n{snippet(p[1]['text'])}" for p in history['pairs']])
         if pairs_text:
             ephemeral('This is the chat history:\n' + pairs_text)
         else:
             ephemeral('The chat history is empty.')
-    elif subcommand == 'gpt':
+    elif cmd == 'gpt' and not arg:
         ephemeral(
             f'I am based on the {gpt_model} model with temperature {gpt_temperature}, presence penalty {gpt_presence_penalty} and frequency penalty {gpt_frequency_penalty}.'
         )
-    elif subcommand in ['', 'help']:
+    elif cmd in ['', 'help']:
         ephemeral(usage)
     else:
-        ephemeral(f"Sorry, I don't recognize the command `{subcommand}`.\n{usage}")
+        ephemeral(f"Sorry, I don't recognize the command `{command['text']}`.\n{usage}")
 
 @app.event('app_home_opened')
 def handle_home_opened(client, event, logger):
@@ -299,9 +327,11 @@ def handle_home_opened(client, event, logger):
                             "text": (
                                 "I am an assistant based on ChatGPT, with the following added features:\n"
                                 "\n"
-                                "*Group chats*. Multiple users can participate in chatting with me, just ping me in a channel or group conversation.\n"
+                                "*Group conversations*. Multiple users can participate in chatting with me, just ping me in a channel or group conversation.\n"
                                 "\n"
                                 "*Threaded conversations*. Reply to me in a thread to go off on a tangent.\n"
+                                "\n"
+                                f"*Custom roles*. Use `/{bot_name} system` to view or change my underlying instructions in the context of a conversation.\n"
                                 "\n"
                                 f"*Freeze and unfreeze history*. Establish a context through dialogue and turn it into a template for answering questions. Type `/{bot_name}` to learn more.\n"
                                 "\n"
