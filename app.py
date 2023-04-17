@@ -124,6 +124,7 @@ def get_history(channel, thread_ts):
             system_message = content
     return {
         'pairs': pairs, 
+        'bot_messages': bot_messages,
         'system_message': system_message or gpt_system_message,
         'recording': recording
     }
@@ -235,6 +236,7 @@ def handle_command(ack, say, command):
         f'/{bot_name} status            Check whether I am recording chat history\n' \
         f'/{bot_name} system            Print my current system message\n' \
         f'/{bot_name} system [message]  Set my system message\n' \
+        f'/{bot_name} undo              Undo the last command or response\n' \
         f'/{bot_name} reset             Clear the chat history and system message\n' \
         f'/{bot_name} list              Print the chat history\n' \
         '```'
@@ -278,6 +280,20 @@ def handle_command(ack, say, command):
                 }
             }
         )
+    elif cmd == 'undo' and not arg:
+        history = get_history(command['channel_id'], command.get('thread_ts'))
+        messages = history['bot_messages']
+        if len(messages):
+            message = messages[len(messages) - 1]
+            app.client.chat_delete(
+                channel = command['channel_id'],
+                ts = message['ts']
+            )
+            say(
+                text = f"Deleted the last command{by_request}:\n>{snippet(message['text'])}"
+            )
+        else:
+            ephemeral('There is nothing to undo.')
     elif cmd == 'reset' and not arg:
         say(
             text = f'Cleared all chat history{by_request}.',
@@ -334,6 +350,8 @@ def handle_home_opened(client, event, logger):
                                 f"*Custom roles*. Use `/{bot_name} system` to view or change my underlying instructions in the context of a conversation.\n"
                                 "\n"
                                 f"*Freeze and unfreeze history*. Establish a context through dialogue and turn it into a template for answering questions. Type `/{bot_name}` to learn more.\n"
+                                "\n"
+                                f"*Undo*. Use `/{bot_name} undo` if the conversation took a wrong turn or you cleared the history by accident.\n"
                                 "\n"
                                 "Please be patient with me, I am in an early stage of development."
                             )
