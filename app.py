@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import time
 
 # Third-party libraries
 from dotenv import load_dotenv
@@ -129,6 +130,10 @@ def get_history(channel, thread_ts):
         'recording': recording
     }
 
+def count_tokens(text, model):
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
 # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
 def count_message_tokens(message, model):
     """Returns the number of tokens used by a message."""
@@ -148,8 +153,9 @@ def count_message_tokens(message, model):
             num_tokens += tokens_per_name
     return num_tokens
 
-def completion_cost(result, model):
-    return result.usage.total_tokens * 0.002 / 1000.0
+def completion_cost(prompt_tokens, response_tokens, model):
+    # TODO: GPT-4
+    return (prompt_tokens + response_tokens) * 0.002 / 1000.0
 
 def handle_request(event, say):
     history = get_history(event['channel'], event.get('thread_ts'))
@@ -177,26 +183,47 @@ def handle_request(event, say):
     messages = [system_message] + list(reversed(history_messages)) + [question_message]
     # print(messages)
 
-    result = openai.ChatCompletion.create(
+    msg = app.client.chat_postMessage(
+        channel = event['channel'],
+        thread_ts = event.get('thread_ts'),
+        text = '...'
+    )
+    msg_time = time.time()
+    response = openai.ChatCompletion.create(
         model = gpt_model,
         max_tokens = gpt_max_tokens - prompt_tokens,  # Use all leftover space
         temperature = gpt_temperature,
         presence_penalty = gpt_presence_penalty,
         frequency_penalty = gpt_frequency_penalty,
-        messages = messages
+        messages = messages,
+        stream = True
     )
-    response = result.choices[0].message.content
-    actual_prompt_tokens = result.usage.prompt_tokens
-    completion_tokens = result.usage.completion_tokens if 'completion_tokens' in result.usage else 0
-    total_tokens = result.usage.total_tokens
-    cost = completion_cost(result, gpt_model)
-    print(f'Completion finished: {actual_prompt_tokens}/{prompt_tokens} prompt tokens, {completion_tokens} completion tokens, {total_tokens} total tokens, {cost} dollars')
+    response_text = ''
+    for chunk in response:
+        chunk_text = chunk['choices'][0]['delta'].get('content', '')
+        now = time.time()
+        if now > msg_time + 1.0:
+            app.client.chat_update(
+                channel = event['channel'],
+                ts = msg['ts'],
+                text = f'{response_text} ...'
+            )
+            msg_time = now
+        response_text += chunk_text
+    response_tokens = count_tokens(response_text, gpt_model)  # FIXME: Not entirely accurate because we don't count the role header?
+    cost = completion_cost(prompt_tokens, response_tokens, gpt_model)
+    print(f'Completion finished: {prompt_tokens} prompt tokens, {response_tokens} response tokens, {prompt_tokens + response_tokens} total tokens, {cost} dollars')
 
+    app.client.chat_delete(
+        channel = event['channel'],
+        ts = msg['ts']
+    )
     is_im = event.get('channel_type') == 'im'
-    prefix = '' if is_im else f"<@{event['user']}> "
-    say(
-        text = prefix + response,
+    suffix = '' if is_im else f" <@{event['user']}>"
+    app.client.chat_postMessage(
+        channel = event['channel'],
         thread_ts = event.get('thread_ts'),
+        text = response_text + suffix,
         metadata = {
             'event_type': 'viccy_response',
             'event_payload': {
