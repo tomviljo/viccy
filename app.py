@@ -206,7 +206,7 @@ def handle_request(event, say):
             app.client.chat_update(
                 channel = event['channel'],
                 ts = msg['ts'],
-                text = f'{response_text} ...'
+                text = response_text + ' ...'
             )
             msg_time = now
         response_text += chunk_text
@@ -214,15 +214,11 @@ def handle_request(event, say):
     cost = completion_cost(prompt_tokens, response_tokens, gpt_model)
     print(f'Completion finished: {prompt_tokens} prompt tokens, {response_tokens} response tokens, {prompt_tokens + response_tokens} total tokens, {cost} dollars')
 
-    app.client.chat_delete(
-        channel = event['channel'],
-        ts = msg['ts']
-    )
     is_im = event.get('channel_type') == 'im'
     suffix = '' if is_im else f" <@{event['user']}>"
-    app.client.chat_postMessage(
+    app.client.chat_update(
         channel = event['channel'],
-        thread_ts = event.get('thread_ts'),
+        ts = msg['ts'],
         text = response_text + suffix,
         metadata = {
             'event_type': 'viccy_response',
